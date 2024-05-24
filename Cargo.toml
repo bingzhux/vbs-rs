@@ -1,0 +1,18 @@
+[package]
+name = "vbs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+
+[dependencies.windows]
+version = "0.56.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Environment",
+    "Win32_System_SystemServices",
+    "Win32_Security_Cryptography"
+
+]
