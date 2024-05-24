@@ -1,6 +1,6 @@
 use std::mem;
 use windows::{
-    core::*, Win32::Security::Cryptography::*, Win32::System::Environment::*,
+    core::*, Win32::Foundation::*, Win32::Security::Cryptography::*, Win32::System::Environment::*,
     Win32::System::SystemServices::*, Win32::System::Threading::*,
 };
 
@@ -89,7 +89,8 @@ fn vbskey() {
     vbsenumeration();
 
     let mut hProv = Default::default();
-    let mut hKey: NCRYPT_KEY_HANDLE = Default::default();
+    let mut hRsaKey: NCRYPT_KEY_HANDLE = Default::default();
+    let mut hAESKey: NCRYPT_KEY_HANDLE = Default::default();
     let kprovider = MS_KEY_STORAGE_PROVIDER;
     // Open the key storage provider and create apersisted vbs key
     unsafe {
@@ -103,9 +104,9 @@ fn vbskey() {
         // Create a persisted RSA key with the VBS flag
         let status = NCryptCreatePersistedKey(
             hProv,
-            &mut hKey,
+            &mut hRsaKey,
             NCRYPT_RSA_ALGORITHM,
-            w!("BingVbsKeyName"),
+            w!("BingVbsRsaKeyName"),
             AT_NOT_SIGNATURE_NOT_KEYEXCHANGE,
             NCRYPT_REQUIRE_VBS_FLAG,
         );
@@ -116,41 +117,83 @@ fn vbskey() {
             return;
         }
 
-        println!("Created a persisted VBS Guard key {:?}!", hKey);
+        println!("Created a persisted VBS Guard RSA key {:?}!", hRsaKey);
 
         // Set the key size to 2048 bits
         let dwKeySize: u32 = 2048;
         let status = NCryptSetProperty(
-            hKey,
+            hRsaKey,
             NCRYPT_LENGTH_PROPERTY,
             dwKeySize.to_le_bytes().as_slice(), // use little-endian byte order for x86
             NCRYPT_FLAGS(0),
         );
         if status.is_err() {
             println!("NCryptSetProperty failed with {:?}", status);
-            let _ = NCryptDeleteKey(hKey, NCRYPT_SILENT_FLAG.0);
+            let _ = NCryptDeleteKey(hRsaKey, NCRYPT_SILENT_FLAG.0);
             let _ = NCryptFreeObject(hProv);
             return;
         }
 
         // Finalize the key to make it usable
-        let status = NCryptFinalizeKey(hKey, NCRYPT_FLAGS(0));
+        let status = NCryptFinalizeKey(hRsaKey, NCRYPT_FLAGS(0));
         if status.is_err() {
             println!("NCryptFinal failed with {:?}", status);
-            let _ = NCryptDeleteKey(hKey, NCRYPT_SILENT_FLAG.0);
+            let _ = NCryptDeleteKey(hRsaKey, NCRYPT_SILENT_FLAG.0);
             let _ = NCryptFreeObject(hProv);
             return;
         }
 
-        let iskey = NCryptIsKeyHandle(hKey);
+        //TODO: now we can use this key after finalizing it, e.g. NCryptEncrypt, NCryptSignHash ...
+
+        let iskey = NCryptIsKeyHandle(hRsaKey);
         if iskey.eq(&true) {
             println!("NCryptIsKeyHandle return with {:?}", iskey);
         }
 
+        let status = NCryptCreatePersistedKey(
+            hProv,
+            &mut hAESKey,
+            NCRYPT_AES_ALGORITHM,
+            w!("BingVbsAesKeyName"),
+            CERT_KEY_SPEC(0),
+            NCRYPT_REQUIRE_VBS_FLAG,
+        );
+        if status.is_err() {
+            println!("NCryptCreatePersistedKey failed with {:?}", status);
+        } else {
+            println!("Created a persisted VBS Guard AES key {:?}!", hAESKey);
+
+            let dwKeySize: u32 = 256;
+            let status = NCryptSetProperty(
+                hAESKey,
+                NCRYPT_LENGTH_PROPERTY,
+                dwKeySize.to_le_bytes().as_slice(), // use little-endian byte order for x86
+                NCRYPT_FLAGS(0),
+            );
+            if status.is_err() {
+                println!("NCryptSetProperty failed with {:?}", status);
+            } else {
+                let status = NCryptFinalizeKey(hAESKey, NCRYPT_FLAGS(0));
+                if status.is_err() {
+                    println!("NCryptFinal failed with {:?}", status);
+                } else {
+                    println!("AES key finalized successfully")
+
+                    // TODO: use this AES to do something like encrytion?
+                }
+            }
+        }
+
+        vbsenumeration();
+
+        if NCryptDeleteKey(hAESKey, NCRYPT_SILENT_FLAG.0).is_ok() {
+            println!("Deleted the AES key");
+        }
+
         // When you have finished using this handle, release it by passing it to the NCryptFreeObject function.
         // To delete the key file on disk, pass the handle to the NCryptDeleteKey function.
-        if NCryptDeleteKey(hKey, NCRYPT_SILENT_FLAG.0).is_ok() {
-            println!("Deleted the key");
+        if NCryptDeleteKey(hRsaKey, NCRYPT_SILENT_FLAG.0).is_ok() {
+            println!("Deleted the RSA key");
         }
 
         if NCryptFreeObject(hProv).is_ok() {
@@ -194,10 +237,99 @@ fn vbsenumeration() {
             }
         }
 
-        // either is ok for below two ways to free buffer
+        // either is ok for below two ways to free buffer ?
         let _ = NCryptFreeBuffer(ppProviderList as *mut std::ffi::c_void);
         // let _ = NCryptFreeBuffer(std::mem::transmute::<*mut _, *mut std::ffi::c_void>(
         //     ppProviderList,
         // ));
+    }
+
+    let mut hProv = Default::default();
+    let kprovider = MS_KEY_STORAGE_PROVIDER; // or MS_PLATFORM_KEY_STORAGE_PROVIDER
+    unsafe {
+        let status = NCryptOpenStorageProvider(&mut hProv, kprovider, 0);
+        if status.is_err() {
+            println!(
+                "NCryptOpenStorageProvider failed with {:?} for {}",
+                status,
+                kprovider.display()
+            );
+            return;
+        }
+    }
+
+    let mut enumstate = std::ptr::null_mut();
+
+    loop {
+        let mut ppKeyName = std::ptr::null_mut();
+        unsafe {
+            // The NCryptEnumKeys function obtains the names of the keys that are stored by the provider.
+            let status =
+                NCryptEnumKeys(hProv, None, &mut ppKeyName, &mut enumstate, NCRYPT_FLAGS(0));
+            if let Err(err) = status {
+                if err.code().eq(&NTE_NO_MORE_ITEMS) {
+                    println!("No more keys found");
+                    break;
+                } else {
+                    println!("NCryptEnumKeys failed with {:?}", err);
+                }
+                break;
+            } else {
+                let keys: &[NCryptKeyName] = std::slice::from_raw_parts(ppKeyName as _, 1usize);
+                for key in keys {
+                    if !key.pszName.is_null() {
+                        println!("Key Name: {}", key.pszName.display());
+                    }
+                    if !key.pszAlgid.is_null() {
+                        println!("Key Alg: {}", key.pszAlgid.display());
+                    }
+                    println!("Key Spec: {:?}", key.dwLegacyKeySpec);
+                    println!("Key Flags: {}", key.dwFlags);
+                }
+                let _ = NCryptFreeBuffer(ppKeyName as *mut std::ffi::c_void);
+            }
+        }
+    }
+
+    unsafe {
+        let _ = NCryptFreeBuffer(enumstate);
+    }
+
+    // The NCryptEnumAlgorithms function obtains the names of the algorithms that are supported by the specified key storage provider.
+
+    let mut ppAlgList = std::ptr::null_mut();
+    let mut pdwAlgCount = 0;
+    unsafe {
+        let status = NCryptEnumAlgorithms(
+            hProv,
+            NCRYPT_OPERATION(0),
+            &mut pdwAlgCount,
+            &mut ppAlgList,
+            0,
+        );
+        if status.is_err() {
+            println!("NCryptEnumAlgorithms failed with {:?}", status);
+            return;
+        }
+        println!("Number of algorithms: {}", pdwAlgCount);
+        let AlgList: &[NCryptAlgorithmName] = std::slice::from_raw_parts(
+            ppAlgList as *const NCryptAlgorithmName,
+            pdwAlgCount as usize,
+        );
+        for alg in AlgList {
+            if !alg.pszName.is_null() {
+                println!("Algorithm Name: {}", alg.pszName.display());
+            }
+            println!("Algorithm Class: {:?}", alg.dwClass);
+            println!("Algorithm Operations: {:?}", alg.dwAlgOperations);
+            println!("Algorithm Flags: {}", alg.dwFlags);
+        }
+        let _ = NCryptFreeBuffer(ppAlgList as *mut std::ffi::c_void);
+    }
+
+    unsafe {
+        if NCryptFreeObject(hProv).is_ok() {
+            println!("Freed the key provider");
+        }
     }
 }
